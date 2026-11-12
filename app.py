@@ -1,7 +1,7 @@
 import pickle
 import numpy as np
 import streamlit as st
-from Orange.data import Domain, Table
+from sklearn.neural_network import MLPRegressor
 
 # 페이지 기본 설정
 st.set_page_config(
@@ -97,53 +97,85 @@ st.markdown(
 )
 
 
+# Orange3 라이브러리 없이 .pkcls 파일을 직접 로드하기 위한 커스텀 Unpickler
+class _DummyOrangeObject:
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        else:
+            self._state = state
+
+
+def _dummy_make_variable(*args, **kwargs):
+    return _DummyOrangeObject(*args, **kwargs)
+
+
+class OrangeSafeUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        # Orange3 신경망 래퍼를 scikit-learn MLPRegressor로 직접 매핑
+        if module == "Orange.regression.neural_network" and name == "MLPRegressorWCallback":
+            return MLPRegressor
+        if module == "Orange.data.variable" and name == "make_variable":
+            return _dummy_make_variable
+        if module.startswith("Orange"):
+            return type(name, (_DummyOrangeObject,), {})
+        # NumPy 1.x / 2.x 간 피클 경로 호환 처리
+        if module.startswith("numpy._core"):
+            try:
+                return super().find_class(module, name)
+            except ModuleNotFoundError:
+                return super().find_class(
+                    module.replace("numpy._core", "numpy.core", 1), name
+                )
+        return super().find_class(module, name)
+
+
 @st.cache_resource
 def load_orange_model(model_path: str = "traffic_casualty_model.pkcls"):
     with open(model_path, "rb") as f:
-        model = pickle.load(f)
-    return model
+        raw_model = OrangeSafeUnpickler(f).load()
+
+    skl_model = raw_model.skl_model
+    attributes = getattr(raw_model.domain, "attributes", ())
+
+    features = []
+    for attr in attributes:
+        feat_name = getattr(attr, "_name", "")
+        normalizer = getattr(attr, "_compute_value", None)
+        offset = (
+            float(np.asarray(normalizer.offset).ravel()[0])
+            if normalizer is not None and hasattr(normalizer, "offset")
+            else 0.0
+        )
+        factor = (
+            float(np.asarray(normalizer.factor).ravel()[0])
+            if normalizer is not None and hasattr(normalizer, "factor")
+            else 1.0
+        )
+        features.append(
+            {
+                "name": feat_name,
+                "offset": offset,
+                "factor": factor,
+            }
+        )
+
+    return {"skl_model": skl_model, "features": features}
 
 
-def predict_casualties(model, sido: str, accidents: float, minor_injuries: float) -> float:
-    """Orange3 모델의 도메인 구조에 맞춰 입력 테이블을 생성하고 예상 사망자 수를 반환합니다."""
-    orig_domain = getattr(model, "original_domain", None) or model.domain
-    pred_domain = Domain(orig_domain.attributes)
+def predict_casualties(bundle: dict, sido: str, accidents: float, minor_injuries: float) -> float:
+    """Orange3 전처리(원-핫 인코딩 + 평균 대체 + 표준화)를 동일하게 적용해 예상 사망자 수를 계산합니다."""
+    scaled_row = []
 
-    # 모델의 원래 피처 순서(['시도', '사고건수', '중상자수', '경상자수', '부상신고자수'])에 맞춰 행 구성
-    # 미입력 연속형 변수는 np.nan으로 전달하면 Orange3 내장 전처리기가 학습 평균으로 자동 대체함
-    row = []
-    for attr in pred_domain.attributes:
-        if attr.name == "시도":
-            row.append(sido)
-        elif attr.name == "사고건수":
-            row.append(float(accidents))
-        elif attr.name == "경상자수":
-            row.append(float(minor_injuries))
-        else:
-            row.append(np.nan)
+    for feat in bundle["features"]:
+        name = feat["name"]
+        offset = feat["offset"]
+        factor = feat["factor"]
 
-    input_table = Table.from_list(pred_domain, [row])
-    prediction = model(input_table)
-
-    # 신경망 회귀 특성상 극소 음수가 나올 경우 0.0으로 보정
-    return max(0.0, float(prediction[0]))
-
-
-# 1. 모델 로드
-try:
-    model = load_orange_model("traffic_casualty_model.pkcls")
-except FileNotFoundError:
-    st.error("❌ `traffic_casualty_model.pkcls` 파일을 찾을 수 없습니다. 같은 폴더에 모델 파일을 업로드해 주세요.")
-    st.stop()
-except Exception as e:
-    st.error(f"❌ 모델 로드 중 오류가 발생했습니다: {e}")
-    st.stop()
-
-# 모델에 학습된 시도 목록 추출 (기본: ['경기', '부산', '서울'])
-orig_domain = getattr(model, "original_domain", None) or model.domain
-sido_options = (
-    list(orig_domain["시도"].values)
-    if "시도" in orig_domain
-    else ["서울", "부산", "경기"]
-)
+        if name.startswith("시도="):
+            target_sido = name.split
 # 보기 편하도록 서울·부산·경기 순으로 정렬
