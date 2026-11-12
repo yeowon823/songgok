@@ -178,4 +178,3 @@ def predict_casualties(bundle: dict, sido: str, accidents: float, minor_injuries
 
         if name.startswith("시도="):
             target_sido = name.split
-# 보기 편하도록 서울·부산·경기 순으로 정렬
