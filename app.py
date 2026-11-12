@@ -1,7 +1,6 @@
 import pickle
 import numpy as np
 import streamlit as st
-from sklearn.neural_network import MLPRegressor
 
 # 페이지 기본 설정
 st.set_page_config(
@@ -97,11 +96,10 @@ st.markdown(
 )
 
 
-# Orange3 라이브러리 없이 .pkcls 파일을 직접 로드하기 위한 커스텀 Unpickler
-class _DummyOrangeObject:
+# Orange3 및 scikit-learn 설치 없이 .pkcls 가중치를 추출하기 위한 순수 파이썬 Unpickler
+class _DummyObject:
     def __init__(self, *args, **kwargs):
-        self._args = args
-        self._kwargs = kwargs
+        pass
 
     def __setstate__(self, state):
         if isinstance(state, dict):
@@ -111,19 +109,15 @@ class _DummyOrangeObject:
 
 
 def _dummy_make_variable(*args, **kwargs):
-    return _DummyOrangeObject(*args, **kwargs)
+    return _DummyObject(*args, **kwargs)
 
 
-class OrangeSafeUnpickler(pickle.Unpickler):
+class PureNumpyUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        # Orange3 신경망 래퍼를 scikit-learn MLPRegressor로 직접 매핑
-        if module == "Orange.regression.neural_network" and name == "MLPRegressorWCallback":
-            return MLPRegressor
         if module == "Orange.data.variable" and name == "make_variable":
             return _dummy_make_variable
-        if module.startswith("Orange"):
-            return type(name, (_DummyOrangeObject,), {})
-        # NumPy 1.x / 2.x 간 피클 경로 호환 처리
+        if module.startswith(("Orange", "sklearn")):
+            return type(name, (_DummyObject,), {})
         if module.startswith("numpy._core"):
             try:
                 return super().find_class(module, name)
@@ -137,11 +131,14 @@ class OrangeSafeUnpickler(pickle.Unpickler):
 @st.cache_resource
 def load_orange_model(model_path: str = "traffic_casualty_model.pkcls"):
     with open(model_path, "rb") as f:
-        raw_model = OrangeSafeUnpickler(f).load()
+        raw_model = PureNumpyUnpickler(f).load()
 
     skl_model = raw_model.skl_model
-    attributes = getattr(raw_model.domain, "attributes", ())
+    coefs = [np.asarray(w, dtype=np.float64) for w in skl_model.coefs_]
+    intercepts = [np.asarray(b, dtype=np.float64) for b in skl_model.intercepts_]
+    activation = getattr(skl_model, "activation", "relu")
 
+    attributes = getattr(raw_model.domain, "attributes", ())
     features = []
     for attr in attributes:
         feat_name = getattr(attr, "_name", "")
@@ -164,11 +161,26 @@ def load_orange_model(model_path: str = "traffic_casualty_model.pkcls"):
             }
         )
 
-    return {"skl_model": skl_model, "features": features}
+    return {
+        "coefs": coefs,
+        "intercepts": intercepts,
+        "activation": activation,
+        "features": features,
+    }
+
+
+def _apply_activation(x: np.ndarray, activation: str) -> np.ndarray:
+    if activation == "relu":
+        return np.maximum(0.0, x)
+    if activation == "tanh":
+        return np.tanh(x)
+    if activation == "logistic":
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+    return x
 
 
 def predict_casualties(bundle: dict, sido: str, accidents: float, minor_injuries: float) -> float:
-    """Orange3 전처리(원-핫 인코딩 + 평균 대체 + 표준화)를 동일하게 적용해 예상 사망자 수를 계산합니다."""
+    """Orange3 전처리 및 다층 퍼셉트론(MLP) 순전파를 NumPy로 직접 계산합니다."""
     scaled_row = []
 
     for feat in bundle["features"]:
@@ -177,4 +189,12 @@ def predict_casualties(bundle: dict, sido: str, accidents: float, minor_injuries
         factor = feat["factor"]
 
         if name.startswith("시도="):
-            target_sido = name.split
+            target_sido = name.split("=", 1)[1]
+            raw_val = 1.0 if sido == target_sido else 0.0
+            scaled_row.append((raw_val - offset) * factor)
+        elif name == "사고건수":
+            scaled_row.append((float(accidents) - offset) * factor)
+        elif name == "경상자수":
+            scaled_row.append((float(minor_injuries) - offset) * factor)
+        else:
+            # 미입력 변수(중상자
